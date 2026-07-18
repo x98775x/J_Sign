@@ -2,11 +2,11 @@
   "build": {
     "core": "stm32",
     "cpu": "cortex-m3",
-    "extra_flags": "-DSTM32F2xx -DSTM32F205xx",
+    "extra_flags": "-DSTM32F2xx -DSTM32F205xx -DARDUINO_GENERIC_F205VCTX",
     "f_cpu": "120000000L",
     "mcu": "stm32f205vct6",
     "product_line": "STM32F205xx",
-    "variant": "STM32F2xx/F205V(C-E-F-G)T"
+    "variant": "STM32F2xx/F205V(B-C-E-F-G)T_F215V(E-G)T"
   },
   "debug": {
     "jlink_device": "STM32F205VC",

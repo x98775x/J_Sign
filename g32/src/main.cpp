@@ -1,23 +1,10 @@
 #include <Arduino.h>
 #include <lvgl.h>
+#include "tft_driver.h"
 
-// ============================================================
-// IMPORTANT - READ BEFORE WIRING ANYTHING
-// ============================================================
-// The TFT35's LCD panel is NOT SPI. Per the BTT pinout diagram it's a
-// 16-bit parallel (8080-style) interface:
-//   CS=PD7  RS=PE2  WR=PD5  RD=PD4  K(backlight)=PD12
-//   DB0-DB15 = PD14,PD15,PD0,PD1,PE7,PE8,PE9,PE10,PE11,PE12,PE13,PE14,PE15,PD8,PD9,PD10
-//
-// That means the LVGL flush callback below (tft_flush) is a STUB.
-// The real display driver needs to either:
-//   (a) bit-bang all 16 data lines + control lines manually, or
-//   (b) use the STM32 FSMC peripheral in 16-bit mode (much faster,
-//       the "correct" way, but needs proper FSMC init code)
-// This is the single biggest remaining chunk of firmware work.
-// Everything else here (LVGL setup, UI objects, animation) will run
-// fine once tft_flush actually pushes pixels to the panel.
-// ============================================================
+// tft_flush, tft_init_panel, and all bus/pin handling now live in
+// tft_driver.h - bit-banged 16-bit parallel driver for the ILI9488.
+// See that file for pin mapping notes.
 
 static const uint16_t SCREEN_W = 480;
 static const uint16_t SCREEN_H = 320;
@@ -32,12 +19,6 @@ static lv_color_t buf1[SCREEN_W * 10];
 #define COL_MINT      lv_color_hex(0xAAFFC3)
 #define COL_PEACH     lv_color_hex(0xFFC896)
 #define COL_SKY       lv_color_hex(0x87CEFA)
-
-// ---- STUB: pushes pixels to the panel. Not implemented yet. ----
-void tft_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
-  // TODO: replace with real FSMC/parallel write once display driver exists
-  lv_disp_flush_ready(disp);
-}
 
 // ---- Build one simple "butterfly": two triangles (wings) as a styled object ----
 static lv_obj_t* make_butterfly(lv_obj_t *parent, lv_color_t color) {
@@ -113,6 +94,8 @@ void build_idle_animation_screen() {
 
 void setup() {
   Serial.begin(115200);
+
+  tft_init_panel();
 
   lv_init();
   lv_disp_draw_buf_init(&draw_buf, buf1, NULL, SCREEN_W * 10);

@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include "tft_driver.h"
+#include "music_player.h"
 
 static const uint16_t SCREEN_W = 480;
 static const uint16_t SCREEN_H = 320;
@@ -434,20 +435,8 @@ void show_music() {
     lv_obj_t *title = make_label(scr_music, LV_SYMBOL_AUDIO " Music", COL_PEACH, &lv_font_montserrat_20);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 15);
 
-    // Placeholder - speaker/amp hardware not wired yet
-    lv_obj_t *msg = make_label(scr_music,
-      "Insert SD card with MP3 files.\n\nSpeaker hardware coming soon!",
-      COL_WHITE, &lv_font_montserrat_16);
-    lv_obj_align(msg, LV_ALIGN_CENTER, 0, 0);
-    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(msg, 360);
-    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
-
-    // TODO: when amp/speaker wired, replace above with:
-    // - SD file browser list (lv_list)
-    // - Play/pause/stop buttons
-    // - Track name label
-    // - Progress bar
+    music_build_ui(scr_music, music_back_cb,
+                   COL_PEACH, COL_LAVENDER, COL_DARK, COL_WHITE, COL_MINT);
   }
   lv_scr_load(scr_music);
   last_input_ms = millis();

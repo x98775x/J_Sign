@@ -2,6 +2,7 @@
 #include <lvgl.h>
 #include "tft_driver.h"
 #include "music_player.h"
+#include "splash.h"
 
 static const uint16_t SCREEN_W = 480;
 static const uint16_t SCREEN_H = 320;
@@ -549,12 +550,12 @@ void setup() {
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
-  // Boot into main menu, tell WLED preset 1 on startup
+  // Boot: show splash screen, auto-transitions to main menu after 3.5s
   last_input_ms = millis();
   send_preset(led_preset);
   send_bri(led_bri);
   send_cmd("ON");
-  show_menu();
+  build_splash_screen();
 }
 
 // ============================================================

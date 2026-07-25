@@ -89,14 +89,12 @@ void setup() {
   Serial.begin(115200);
 
   // UART0 to GD32 mainboard
-  Serial1.setRX(1);
-  Serial1.setTX(0);
-  Serial1.begin(GD32_BAUD);
+  // GP0/GP1 are hardwired to the onboard ESP8285 on this Pico W clone.
+  // Arduino-Pico core uses Serial1(pin,pin) constructor syntax, not setTX/setRX.
+  Serial1.begin(GD32_BAUD, SERIAL_8N1, 13, 12); // RX=GP13, TX=GP12
 
   // UART1 to WLED board
-  Serial2.setRX(5);
-  Serial2.setTX(4);
-  Serial2.begin(WLED_BAUD);
+  Serial2.begin(WLED_BAUD, SERIAL_8N1, 5, 4);   // RX=GP5, TX=GP4
 
   gd32Buffer.reserve(64);
   wledBuffer.reserve(128);

@@ -68,6 +68,8 @@ void wledSetBrightness(uint8_t bri) {
 //   "BRI:180"     -> set brightness to 180
 void handleGD32Command(String cmd) {
   cmd.trim();
+  Serial.print("Received: ");
+  Serial.println(cmd);
   if (cmd.length() == 0) return;
 
   if (cmd.startsWith("PRESET:")) {
@@ -104,6 +106,17 @@ void setup() {
 }
 
 void loop() {
+  //------ Testing ------
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+        handleGD32Command(gd32Buffer);
+        gd32Buffer = "";
+    } else if (c != '\r') {
+        gd32Buffer += c;
+    }
+  }
+
   // ---- Read from GD32, act on commands ----
   while (Serial1.available()) {
     char c = Serial1.read();

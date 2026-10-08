@@ -2,6 +2,8 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <driver/i2s.h>
+#include <math.h>
 
 // ============================================================
 // ESP32 DevKitC V4 Bridge Firmware
@@ -33,8 +35,76 @@ const char* AP_SSID = "ledsign-bridge";
 const char* AP_PASS = "change-me-1234";   // min 8 chars, WPA2
 const char* WLED_IP = "192.168.4.2";      // set this as WLED's static IP
 
+// NS4168 I2S mono amplifier (ESP32 output; no SD playback yet)
+// ESP32 GPIO27 -> BCLK, GPIO26 -> LRCLK, GPIO25 -> DIN
+// Power amp from regulated 5V and shared GND; speaker only to OUT+ / OUT-.
+#define AMP_BCLK 27
+#define AMP_LRCLK 26
+#define AMP_DIN 25
+#define AUDIO_RATE 22050
+
+static bool audioReady = false;
+static uint32_t toneRemaining = 0;
+static uint32_t tonePhase = 0;
+
+void audioBegin() {
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = AUDIO_RATE;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = 0;
+  cfg.dma_buf_count = 4;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = AMP_BCLK;
+  pins.ws_io_num = AMP_LRCLK;
+  pins.data_out_num = AMP_DIN;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) {
+    Serial.println("[AUDIO] I2S driver install failed");
+    return;
+  }
+  if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) {
+    Serial.println("[AUDIO] I2S pin setup failed");
+    i2s_driver_uninstall(I2S_NUM_0);
+    return;
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+  audioReady = true;
+  Serial.println("[AUDIO] NS4168 I2S ready: BCLK=27 LRCLK=26 DIN=25");
+}
+
+void audioTest() {
+  if (!audioReady) return;
+  tonePhase = 0;
+  toneRemaining = AUDIO_RATE / 2; // 0.5s, 440Hz test tone
+  Serial.println("[AUDIO] 440Hz test tone");
+}
+
+// Feed one short chunk per loop, avoiding a half-second stall of GD32 commands.
+void audioTick() {
+  if (!audioReady || !toneRemaining) return;
+  int16_t frames[128 * 2]; // standard stereo I2S; same mono sample L/R
+  const uint32_t count = toneRemaining < 128 ? toneRemaining : 128;
+  for (uint32_t i = 0; i < count; ++i) {
+    int16_t sample = (int16_t)(sin(6.28318530718f * 440.0f * tonePhase / AUDIO_RATE) * 4000.0f);
+    frames[i * 2] = sample;
+    frames[i * 2 + 1] = sample;
+    ++tonePhase;
+  }
+  size_t sent = 0;
+  // Short bounded wait, so UART handling remains responsive.
+  i2s_write(I2S_NUM_0, frames, count * 4, &sent, pdMS_TO_TICKS(2));
+  toneRemaining -= sent / 4;
+}
+
 HardwareSerial SerialGD32(1);  // UART1
 String gd32Buffer = "";
+static bool gd32Overflow = false;
 
 // ============================================================
 // WLED JSON HTTP API - one POST per call, same shapes as before
@@ -43,10 +113,12 @@ bool wledPost(const String& jsonBody) {
   HTTPClient http;
   String url = String("http://") + WLED_IP + "/json/state";
   http.begin(url);
+  http.setConnectTimeout(300);
+  http.setTimeout(500);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(jsonBody);
   http.end();
-  if (code != 200) {
+  if (code < 200 || code >= 300) {
     Serial.printf("[WLED] POST failed, code=%d body=%s\n", code, jsonBody.c_str());
     return false;
   }
@@ -128,7 +200,12 @@ void handleGD32Command(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
-  if (cmd.startsWith("PRESET:")) {
+  if (cmd == "AUDIO:TEST") {
+    audioTest();
+  } else if (cmd == "AUDIO:STOP") {
+    toneRemaining = 0;
+    if (audioReady) i2s_zero_dma_buffer(I2S_NUM_0);
+  } else if (cmd.startsWith("PRESET:")) {
     wledSelectPreset(cmd.substring(7).toInt());
   } else if (cmd == "ON") {
     wledSetPower(true);
@@ -168,6 +245,7 @@ void setup() {
   // UART1 -> GD32 mainboard (unchanged)
   SerialGD32.begin(GD32_BAUD, SERIAL_8N1, GD32_RX, GD32_TX);
   gd32Buffer.reserve(64);
+  audioBegin();
 
   // Host the closed local AP for the WLED board to join
   WiFi.mode(WIFI_AP);
@@ -184,13 +262,23 @@ void setup() {
 // ============================================================
 void loop() {
   while (SerialGD32.available()) {
-    char c = SerialGD32.read();
+    char c = (char)SerialGD32.read();
     if (c == '\n') {
-      handleGD32Command(gd32Buffer);
+      if (!gd32Overflow) handleGD32Command(gd32Buffer);
       gd32Buffer = "";
-    } else if (c != '\r') {
-      gd32Buffer += c;
+      gd32Overflow = false;
+    } else if (c != '\r' && !gd32Overflow) {
+      if (gd32Buffer.length() < 96) gd32Buffer += c;
+      else { gd32Buffer = ""; gd32Overflow = true; Serial.println("[GD32] Discarded oversized command"); }
     }
   }
+  // USB serial terminal: type AUDIO:TEST then Enter for speaker test.
+  static String usbBuffer;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') { handleGD32Command(usbBuffer); usbBuffer = ""; }
+    else if (c != '\r' && usbBuffer.length() < 96) usbBuffer += c;
+  }
+  audioTick();
   // Encoder/knob lives on GD32 side - GD32 sends commands here
 }

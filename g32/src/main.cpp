@@ -62,7 +62,7 @@ static bool btn_pressed = false;
 static bool btn_last    = HIGH;
 
 // ============================================================
-// Send command to Pico over UART4
+// Send command to ESP32 over UART4
 // ============================================================
 void send_cmd(const char *cmd) {
   Serial4.println(cmd);

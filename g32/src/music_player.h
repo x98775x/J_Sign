@@ -3,6 +3,8 @@
 #include <SdFat.h>
 #include <lvgl.h>
 
+void show_menu();
+
 // ============================================================
 // SD card pin mapping (per BTT TFT35 pinout)
 //   CS=PA4  MOSI=PA7  CLK=PA5  MISO=PA6  DET=PC4
@@ -107,6 +109,13 @@ const char* music_current_name() {
 static lv_obj_t *music_list     = NULL;
 static lv_obj_t *lbl_now        = NULL;
 static lv_obj_t *lbl_status     = NULL;
+static lv_obj_t *music_btn_back = NULL;
+static lv_obj_t *music_btn_prev = NULL;
+static lv_obj_t *music_btn_pp   = NULL;
+static lv_obj_t *music_btn_next = NULL;
+static lv_obj_t *music_focus_obj[4];
+static int music_focus = 0;
+static const int MUSIC_FOCUS_COUNT = 4;
 
 void music_refresh_ui();
 
@@ -160,42 +169,38 @@ void music_build_ui(lv_obj_t *scr,
     lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_14, 0);
     lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 75);
 
-    // Prev / Play-Pause / Next controls
-    // -- Prev --
-    lv_obj_t *btn_prev = lv_btn_create(scr);
-    lv_obj_set_size(btn_prev, 60, 45);
-    lv_obj_align(btn_prev, LV_ALIGN_BOTTOM_MID, -80, -15);
-    lv_obj_set_style_bg_color(btn_prev, col_lavender, 0);
-    lv_obj_set_style_radius(btn_prev, 10, 0);
-    lv_obj_set_style_border_width(btn_prev, 0, 0);
-    lv_obj_add_event_cb(btn_prev, music_prev_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_prev = lv_label_create(btn_prev);
+    music_btn_prev = lv_btn_create(scr);
+    lv_obj_set_size(music_btn_prev, 60, 45);
+    lv_obj_align(music_btn_prev, LV_ALIGN_BOTTOM_MID, -80, -15);
+    lv_obj_set_style_bg_color(music_btn_prev, col_lavender, 0);
+    lv_obj_set_style_radius(music_btn_prev, 10, 0);
+    lv_obj_set_style_border_width(music_btn_prev, 0, 0);
+    lv_obj_add_event_cb(music_btn_prev, music_prev_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_prev = lv_label_create(music_btn_prev);
     lv_label_set_text(lbl_prev, LV_SYMBOL_PREV);
     lv_obj_set_style_text_color(lbl_prev, col_dark, 0);
     lv_obj_center(lbl_prev);
 
-    // -- Play/Pause --
-    lv_obj_t *btn_pp = lv_btn_create(scr);
-    lv_obj_set_size(btn_pp, 80, 55);
-    lv_obj_align(btn_pp, LV_ALIGN_BOTTOM_MID, 0, -15);
-    lv_obj_set_style_bg_color(btn_pp, col_peach, 0);
-    lv_obj_set_style_radius(btn_pp, 12, 0);
-    lv_obj_set_style_border_width(btn_pp, 0, 0);
-    lv_obj_add_event_cb(btn_pp, music_playpause_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_pp = lv_label_create(btn_pp);
+    music_btn_pp = lv_btn_create(scr);
+    lv_obj_set_size(music_btn_pp, 80, 55);
+    lv_obj_align(music_btn_pp, LV_ALIGN_BOTTOM_MID, 0, -15);
+    lv_obj_set_style_bg_color(music_btn_pp, col_peach, 0);
+    lv_obj_set_style_radius(music_btn_pp, 12, 0);
+    lv_obj_set_style_border_width(music_btn_pp, 0, 0);
+    lv_obj_add_event_cb(music_btn_pp, music_playpause_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_pp = lv_label_create(music_btn_pp);
     lv_label_set_text(lbl_pp, LV_SYMBOL_PLAY);
     lv_obj_set_style_text_color(lbl_pp, col_dark, 0);
     lv_obj_center(lbl_pp);
 
-    // -- Next --
-    lv_obj_t *btn_next = lv_btn_create(scr);
-    lv_obj_set_size(btn_next, 60, 45);
-    lv_obj_align(btn_next, LV_ALIGN_BOTTOM_MID, 80, -15);
-    lv_obj_set_style_bg_color(btn_next, col_lavender, 0);
-    lv_obj_set_style_radius(btn_next, 10, 0);
-    lv_obj_set_style_border_width(btn_next, 0, 0);
-    lv_obj_add_event_cb(btn_next, music_next_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lbl_next = lv_label_create(btn_next);
+    music_btn_next = lv_btn_create(scr);
+    lv_obj_set_size(music_btn_next, 60, 45);
+    lv_obj_align(music_btn_next, LV_ALIGN_BOTTOM_MID, 80, -15);
+    lv_obj_set_style_bg_color(music_btn_next, col_lavender, 0);
+    lv_obj_set_style_radius(music_btn_next, 10, 0);
+    lv_obj_set_style_border_width(music_btn_next, 0, 0);
+    lv_obj_add_event_cb(music_btn_next, music_next_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lbl_next = lv_label_create(music_btn_next);
     lv_label_set_text(lbl_next, LV_SYMBOL_NEXT);
     lv_obj_set_style_text_color(lbl_next, col_dark, 0);
     lv_obj_center(lbl_next);
@@ -227,5 +232,42 @@ void music_build_ui(lv_obj_t *scr,
         lv_obj_set_width(no_files, 360);
         lv_obj_set_style_text_align(no_files, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_align(no_files, LV_ALIGN_CENTER, 0, 0);
+    }
+}
+
+static void highlight_music() {
+    music_focus_obj[0] = music_btn_back;
+    music_focus_obj[1] = music_btn_prev;
+    music_focus_obj[2] = music_btn_pp;
+    music_focus_obj[3] = music_btn_next;
+    for (int i = 0; i < MUSIC_FOCUS_COUNT; i++) {
+        if (!music_focus_obj[i]) continue;
+        bool on = (i == music_focus);
+        lv_obj_set_style_border_width(music_focus_obj[i], on ? 3 : 0, 0);
+        lv_obj_set_style_border_color(music_focus_obj[i], lv_color_hex(0xFFFFFF), 0);
+    }
+}
+
+void music_set_back_btn(lv_obj_t *back) {
+    music_btn_back = back;
+    music_focus = 0;
+    highlight_music();
+}
+
+void music_encoder_rotate(int delta) {
+    music_focus = (music_focus + delta + MUSIC_FOCUS_COUNT) % MUSIC_FOCUS_COUNT;
+    highlight_music();
+}
+
+void music_encoder_click() {
+    switch (music_focus) {
+        case 0: show_menu(); break;
+        case 1: music_prev(); music_refresh_ui(); break;
+        case 2:
+            if (music_playing) music_stop();
+            else music_play(music_sel);
+            music_refresh_ui();
+            break;
+        case 3: music_next(); music_refresh_ui(); break;
     }
 }

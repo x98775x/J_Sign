@@ -5,7 +5,7 @@
 // ============================================================
 // Custom LED Editor Screen
 // Lets user pick color, effect, speed, intensity, save preset
-// Commands sent over UART to Pico bridge:
+// Commands sent over UART to the ESP32 bridge:
 //   COLOR:r,g,b   -> set primary color
 //   FX:id         -> set effect by ID
 //   SX:val        -> set speed (0-255)
@@ -54,19 +54,47 @@ static uint8_t custom_ix = 128;
 static int     save_slot = 15; // default save to slot 15+
 
 // ---- LVGL objects ----
-static lv_obj_t *lbl_color_preview = NULL;
 static lv_obj_t *slider_r = NULL, *slider_g = NULL, *slider_b = NULL;
 static lv_obj_t *lbl_r = NULL, *lbl_g = NULL, *lbl_b = NULL;
 static lv_obj_t *roller_fx = NULL;
 static lv_obj_t *slider_sx = NULL, *slider_ix = NULL;
 static lv_obj_t *lbl_sx = NULL, *lbl_ix = NULL;
 static lv_obj_t *color_box = NULL;
+static lv_obj_t *custom_back_btn = NULL;
+static lv_obj_t *custom_save_btn = NULL;
+static lv_obj_t *custom_save_lbl = NULL;
+static lv_obj_t *custom_slot_btn = NULL;
+static lv_obj_t *custom_slot_lbl = NULL;
+static lv_obj_t *custom_fx_prev = NULL;
+static lv_obj_t *custom_fx_next = NULL;
+static lv_color_t custom_col_pink;
+static lv_timer_t *save_flash_tmr = NULL;
+static uint32_t last_color_ms = 0;
+static bool color_pending = false;
 
-// ---- Send current color to WLED ----
-static void send_color() {
+enum {
+  CF_BACK = 0,
+  CF_R, CF_G, CF_B,
+  CF_SX, CF_IX,
+  CF_FX_PREV, CF_FX_NEXT,
+  CF_SLOT, CF_SAVE,
+  CF_COUNT
+};
+static lv_obj_t *custom_focus_obj[CF_COUNT];
+static int custom_focus = CF_BACK;
+static bool custom_editing = false;
+
+// ---- Send current color to WLED (throttled; force=true flushes now) ----
+static void send_color(bool force = false) {
+  if (!force) {
+    color_pending = true;
+    if (millis() - last_color_ms < 80) return;
+  }
   char buf[32];
   snprintf(buf, sizeof(buf), "COLOR:%d,%d,%d", custom_r, custom_g, custom_b);
   send_cmd(buf);
+  last_color_ms = millis();
+  color_pending = false;
 }
 
 static void send_fx() {
@@ -135,20 +163,85 @@ static void roller_fx_cb(lv_event_t *e) {
   send_fx();
 }
 
-// ---- Save preset callback ----
-static void save_preset_cb(lv_event_t *e) {
+static void refresh_slot_label() {
+  if (!custom_slot_lbl) return;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "Slot %d", save_slot);
+  lv_label_set_text(custom_slot_lbl, buf);
+}
+
+static void save_flash_done(lv_timer_t *t) {
+  lv_timer_del(t);
+  save_flash_tmr = NULL;
+  if (custom_save_btn) lv_obj_set_style_bg_color(custom_save_btn, custom_col_pink, 0);
+}
+
+static void do_save_preset() {
   char buf[16];
   snprintf(buf, sizeof(buf), "SAVE:%d", save_slot);
   send_cmd(buf);
-  // Flash the button briefly to confirm
-  lv_obj_t *btn = lv_event_get_target(e);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(0xAAFFC3), 0);
-  // TODO: add a timer to restore color after 500ms
+  if (custom_save_btn) lv_obj_set_style_bg_color(custom_save_btn, lv_color_hex(0xAAFFC3), 0);
+  if (save_flash_tmr) { lv_timer_del(save_flash_tmr); save_flash_tmr = NULL; }
+  save_flash_tmr = lv_timer_create(save_flash_done, 500, NULL);
+}
+
+static void save_preset_cb(lv_event_t *e) {
+  (void)e;
+  do_save_preset();
 }
 
 static void custom_back_cb(lv_event_t *e) {
+  (void)e;
+  if (color_pending) send_color(true);
   show_menu();
 }
+
+static void refresh_fx_ui() {
+  if (roller_fx) lv_roller_set_selected(roller_fx, custom_fx, LV_ANIM_OFF);
+}
+
+static void custom_fx_prev_cb(lv_event_t *e) {
+  (void)e;
+  if (custom_fx > 0) custom_fx--;
+  refresh_fx_ui();
+  send_fx();
+}
+
+static void custom_fx_next_cb(lv_event_t *e) {
+  (void)e;
+  if (custom_fx < (int)NUM_EFFECTS - 1) custom_fx++;
+  refresh_fx_ui();
+  send_fx();
+}
+
+static void highlight_custom() {
+  for (int i = 0; i < CF_COUNT; i++) {
+    if (!custom_focus_obj[i]) continue;
+    bool on = (i == custom_focus);
+    lv_obj_set_style_border_width(custom_focus_obj[i], on ? 3 : 0, 0);
+    lv_obj_set_style_border_color(custom_focus_obj[i],
+      (on && custom_editing) ? lv_color_hex(0xAAFFC3) : lv_color_hex(0xFFFFFF), 0);
+  }
+}
+
+static void refresh_rgb_labels() {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "R: %d", custom_r); lv_label_set_text(lbl_r, buf);
+  snprintf(buf, sizeof(buf), "G: %d", custom_g); lv_label_set_text(lbl_g, buf);
+  snprintf(buf, sizeof(buf), "B: %d", custom_b); lv_label_set_text(lbl_b, buf);
+  snprintf(buf, sizeof(buf), "Speed: %d", custom_sx); lv_label_set_text(lbl_sx, buf);
+  snprintf(buf, sizeof(buf), "Intensity: %d", custom_ix); lv_label_set_text(lbl_ix, buf);
+  if (slider_r) lv_slider_set_value(slider_r, custom_r, LV_ANIM_OFF);
+  if (slider_g) lv_slider_set_value(slider_g, custom_g, LV_ANIM_OFF);
+  if (slider_b) lv_slider_set_value(slider_b, custom_b, LV_ANIM_OFF);
+  if (slider_sx) lv_slider_set_value(slider_sx, custom_sx, LV_ANIM_OFF);
+  if (slider_ix) lv_slider_set_value(slider_ix, custom_ix, LV_ANIM_OFF);
+  refresh_color_box();
+}
+
+void custom_encoder_rotate(int delta);
+void custom_encoder_click();
+void custom_reset_focus();
 
 // ---- Build the custom screen ----
 // Call once, pass in the screen object already created in main.cpp
@@ -161,15 +254,17 @@ void custom_build_ui(lv_obj_t *scr,
                      lv_color_t col_dark,
                      lv_color_t col_white) {
 
+  custom_col_pink = col_pink;
+
   // ---- Back button ----
-  lv_obj_t *back = lv_btn_create(scr);
-  lv_obj_set_size(back, 100, 40);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 10, 10);
-  lv_obj_set_style_bg_color(back, col_lavender, 0);
-  lv_obj_set_style_radius(back, 10, 0);
-  lv_obj_set_style_border_width(back, 0, 0);
-  lv_obj_add_event_cb(back, custom_back_cb, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *back_lbl = lv_label_create(back);
+  custom_back_btn = lv_btn_create(scr);
+  lv_obj_set_size(custom_back_btn, 100, 40);
+  lv_obj_align(custom_back_btn, LV_ALIGN_TOP_LEFT, 10, 10);
+  lv_obj_set_style_bg_color(custom_back_btn, col_lavender, 0);
+  lv_obj_set_style_radius(custom_back_btn, 10, 0);
+  lv_obj_set_style_border_width(custom_back_btn, 0, 0);
+  lv_obj_add_event_cb(custom_back_btn, custom_back_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *back_lbl = lv_label_create(custom_back_btn);
   lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
   lv_obj_set_style_text_color(back_lbl, col_dark, 0);
   lv_obj_center(back_lbl);
@@ -281,19 +376,31 @@ void custom_build_ui(lv_obj_t *scr,
   lv_obj_set_style_bg_color(slider_ix, col_peach, LV_PART_KNOB);
   lv_obj_add_event_cb(slider_ix, slider_ix_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // ---- Save preset button ----
-  lv_obj_t *save_btn = lv_btn_create(scr);
-  lv_obj_set_size(save_btn, 140, 45);
-  lv_obj_align(save_btn, LV_ALIGN_BOTTOM_LEFT, 15, -15);
-  lv_obj_set_style_bg_color(save_btn, col_pink, 0);
-  lv_obj_set_style_radius(save_btn, 10, 0);
-  lv_obj_set_style_border_width(save_btn, 0, 0);
-  lv_obj_add_event_cb(save_btn, save_preset_cb, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *save_lbl = lv_label_create(save_btn);
-  lv_label_set_text(save_lbl, LV_SYMBOL_SAVE " Save Preset");
-  lv_obj_set_style_text_color(save_lbl, col_dark, 0);
-  lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_14, 0);
-  lv_obj_center(save_lbl);
+  // ---- Slot + Save ----
+  custom_slot_btn = lv_btn_create(scr);
+  lv_obj_set_size(custom_slot_btn, 90, 45);
+  lv_obj_align(custom_slot_btn, LV_ALIGN_BOTTOM_LEFT, 15, -15);
+  lv_obj_set_style_bg_color(custom_slot_btn, col_sky, 0);
+  lv_obj_set_style_radius(custom_slot_btn, 10, 0);
+  lv_obj_set_style_border_width(custom_slot_btn, 0, 0);
+  custom_slot_lbl = lv_label_create(custom_slot_btn);
+  refresh_slot_label();
+  lv_obj_set_style_text_color(custom_slot_lbl, col_dark, 0);
+  lv_obj_set_style_text_font(custom_slot_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_center(custom_slot_lbl);
+
+  custom_save_btn = lv_btn_create(scr);
+  lv_obj_set_size(custom_save_btn, 110, 45);
+  lv_obj_align(custom_save_btn, LV_ALIGN_BOTTOM_LEFT, 115, -15);
+  lv_obj_set_style_bg_color(custom_save_btn, col_pink, 0);
+  lv_obj_set_style_radius(custom_save_btn, 10, 0);
+  lv_obj_set_style_border_width(custom_save_btn, 0, 0);
+  lv_obj_add_event_cb(custom_save_btn, save_preset_cb, LV_EVENT_CLICKED, NULL);
+  custom_save_lbl = lv_label_create(custom_save_btn);
+  lv_label_set_text(custom_save_lbl, LV_SYMBOL_SAVE " Save");
+  lv_obj_set_style_text_color(custom_save_lbl, col_dark, 0);
+  lv_obj_set_style_text_font(custom_save_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_center(custom_save_lbl);
 
   // ============================================================
   // RIGHT PANEL: Effect roller
@@ -316,9 +423,9 @@ void custom_build_ui(lv_obj_t *scr,
 
   roller_fx = lv_roller_create(scr);
   lv_roller_set_options(roller_fx, roller_opts, LV_ROLLER_MODE_NORMAL);
-  lv_roller_set_visible_row_count(roller_fx, 6);
+  lv_roller_set_visible_row_count(roller_fx, 5);
   lv_roller_set_selected(roller_fx, custom_fx, LV_ANIM_OFF);
-  lv_obj_set_size(roller_fx, 200, 200);
+  lv_obj_set_size(roller_fx, 200, 170);
   lv_obj_align(roller_fx, LV_ALIGN_TOP_RIGHT, -15, 75);
   lv_obj_set_style_bg_color(roller_fx, col_dark, 0);
   lv_obj_set_style_text_color(roller_fx, col_white, 0);
@@ -329,4 +436,92 @@ void custom_build_ui(lv_obj_t *scr,
   lv_obj_set_style_border_width(roller_fx, 1, 0);
   lv_obj_set_style_radius(roller_fx, 8, 0);
   lv_obj_add_event_cb(roller_fx, roller_fx_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+  custom_fx_prev = lv_btn_create(scr);
+  lv_obj_set_size(custom_fx_prev, 90, 36);
+  lv_obj_align(custom_fx_prev, LV_ALIGN_BOTTOM_RIGHT, -115, -15);
+  lv_obj_set_style_bg_color(custom_fx_prev, col_peach, 0);
+  lv_obj_set_style_radius(custom_fx_prev, 10, 0);
+  lv_obj_set_style_border_width(custom_fx_prev, 0, 0);
+  lv_obj_add_event_cb(custom_fx_prev, custom_fx_prev_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *fxpl = lv_label_create(custom_fx_prev);
+  lv_label_set_text(fxpl, LV_SYMBOL_PREV " FX");
+  lv_obj_set_style_text_color(fxpl, col_dark, 0);
+  lv_obj_center(fxpl);
+
+  custom_fx_next = lv_btn_create(scr);
+  lv_obj_set_size(custom_fx_next, 90, 36);
+  lv_obj_align(custom_fx_next, LV_ALIGN_BOTTOM_RIGHT, -15, -15);
+  lv_obj_set_style_bg_color(custom_fx_next, col_peach, 0);
+  lv_obj_set_style_radius(custom_fx_next, 10, 0);
+  lv_obj_set_style_border_width(custom_fx_next, 0, 0);
+  lv_obj_add_event_cb(custom_fx_next, custom_fx_next_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *fxnl = lv_label_create(custom_fx_next);
+  lv_label_set_text(fxnl, "FX " LV_SYMBOL_NEXT);
+  lv_obj_set_style_text_color(fxnl, col_dark, 0);
+  lv_obj_center(fxnl);
+
+  custom_focus_obj[CF_BACK]    = custom_back_btn;
+  custom_focus_obj[CF_R]       = slider_r;
+  custom_focus_obj[CF_G]       = slider_g;
+  custom_focus_obj[CF_B]       = slider_b;
+  custom_focus_obj[CF_SX]      = slider_sx;
+  custom_focus_obj[CF_IX]      = slider_ix;
+  custom_focus_obj[CF_FX_PREV] = custom_fx_prev;
+  custom_focus_obj[CF_FX_NEXT] = custom_fx_next;
+  custom_focus_obj[CF_SLOT]    = custom_slot_btn;
+  custom_focus_obj[CF_SAVE]    = custom_save_btn;
+  custom_reset_focus();
+}
+
+void custom_reset_focus() {
+  custom_editing = false;
+  custom_focus = CF_BACK;
+  highlight_custom();
+}
+
+void custom_encoder_rotate(int delta) {
+  if (custom_editing) {
+    switch (custom_focus) {
+      case CF_R:  custom_r  = constrain((int)custom_r  + delta * 8, 0, 255); refresh_rgb_labels(); send_color(false); break;
+      case CF_G:  custom_g  = constrain((int)custom_g  + delta * 8, 0, 255); refresh_rgb_labels(); send_color(false); break;
+      case CF_B:  custom_b  = constrain((int)custom_b  + delta * 8, 0, 255); refresh_rgb_labels(); send_color(false); break;
+      case CF_SX: custom_sx = constrain((int)custom_sx + delta * 8, 0, 255); refresh_rgb_labels(); send_sx(); break;
+      case CF_IX: custom_ix = constrain((int)custom_ix + delta * 8, 0, 255); refresh_rgb_labels(); send_ix(); break;
+      case CF_SLOT:
+        save_slot = constrain(save_slot + delta, 15, 40);
+        refresh_slot_label();
+        break;
+      default: break;
+    }
+    return;
+  }
+  custom_focus = (custom_focus + delta + CF_COUNT) % CF_COUNT;
+  highlight_custom();
+}
+
+void custom_encoder_click() {
+  switch (custom_focus) {
+    case CF_BACK:
+      if (color_pending) send_color(true);
+      show_menu();
+      break;
+    case CF_SAVE:
+      if (color_pending) send_color(true);
+      do_save_preset();
+      break;
+    case CF_FX_PREV:
+      custom_fx_prev_cb(NULL);
+      break;
+    case CF_FX_NEXT:
+      custom_fx_next_cb(NULL);
+      break;
+    case CF_R: case CF_G: case CF_B: case CF_SX: case CF_IX: case CF_SLOT:
+      custom_editing = !custom_editing;
+      if (!custom_editing && color_pending) send_color(true);
+      highlight_custom();
+      break;
+    default:
+      break;
+  }
 }

@@ -19,9 +19,9 @@ static lv_color_t buf1[SCREEN_W * 10];
 #define ENC_BTN PC8
 
 // ============================================================
-// UART4 to Pico bridge (TX4=PA0)
+// UART4 to ESP32 bridge (TX4=PA0)
 // ============================================================
-#define BRIDGE_BAUD 115200
+#define BRIDGE_BAUD 115200  // UART4 -> ESP32 bridge
 
 // ============================================================
 // Pastel palette
@@ -62,7 +62,7 @@ static bool btn_pressed = false;
 static bool btn_last    = HIGH;
 
 // ============================================================
-// Send command to Pico over UART4
+// Send command to ESP32 over UART4
 // ============================================================
 void send_cmd(const char *cmd) {
   Serial4.println(cmd);
@@ -146,19 +146,29 @@ static lv_obj_t* make_label(lv_obj_t *p, const char *txt,
 }
 
 static lv_obj_t* make_btn(lv_obj_t *p, const char *txt,
-                            lv_color_t bg, lv_event_cb_t cb) {
+                            lv_color_t bg, lv_event_cb_t cb,
+                            void *user_data = NULL) {
   lv_obj_t *btn = lv_btn_create(p);
   lv_obj_set_style_bg_color(btn, bg, 0);
   lv_obj_set_style_bg_color(btn, lv_color_mix(bg, lv_color_black(), 200),
                               LV_STATE_PRESSED);
   lv_obj_set_style_radius(btn, 12, 0);
   lv_obj_set_style_border_width(btn, 0, 0);
-  if (cb) lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_border_color(btn, COL_WHITE, 0);
+  if (cb) lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
   lv_obj_t *lbl = lv_label_create(btn);
   lv_label_set_text(lbl, txt);
   lv_obj_set_style_text_color(lbl, COL_DARK, 0);
   lv_obj_center(lbl);
   return btn;
+}
+
+static void set_box_focus(lv_obj_t **boxes, int count, int sel) {
+  for (int i = 0; i < count; i++) {
+    if (!boxes[i]) continue;
+    lv_obj_set_style_border_width(boxes[i], i == sel ? 3 : 0, 0);
+    lv_obj_set_style_border_color(boxes[i], COL_WHITE, 0);
+  }
 }
 
 // ============================================================
@@ -212,10 +222,10 @@ void show_menu() {
 
     // 4 buttons, slightly narrower to fit
     for (int i = 0; i < 4; i++) {
-      menu_btns[i] = make_btn(scr_menu, menu_labels[i], menu_colors[i], menu_btn_cb);
+      menu_btns[i] = make_btn(scr_menu, menu_labels[i], menu_colors[i],
+                             menu_btn_cb, (void*)(intptr_t)i);
       lv_obj_set_size(menu_btns[i], 105, 190);
       lv_obj_align(menu_btns[i], LV_ALIGN_CENTER, (i-1)*112 + (i>1?-4:4), 20);
-      lv_obj_set_user_data(menu_btns[i], (void*)(intptr_t)i);
     }
     refresh_menu_highlight();
   }
@@ -242,6 +252,12 @@ static lv_obj_t *lbl_preset_num  = NULL;
 static lv_obj_t *lbl_bri         = NULL;
 static lv_obj_t *bar_bri         = NULL;
 static lv_obj_t *lbl_power       = NULL;
+static lv_obj_t *led_boxes[6];
+static int led_focus = 0;
+#define LED_BOX_COUNT 6
+
+static lv_obj_t *viz_boxes[2];
+static int viz_focus = 0;
 
 void refresh_led_screen() {
   if (!lbl_preset_name) return;
@@ -288,8 +304,8 @@ void show_leds() {
     lv_obj_set_style_bg_opa(scr_leds, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr_leds, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back = make_btn(scr_leds, LV_SYMBOL_LEFT " Back", COL_LAVENDER, led_back_cb);
-    lv_obj_set_size(back, 100, 40); lv_obj_align(back, LV_ALIGN_TOP_LEFT, 10, 10);
+    led_boxes[0] = make_btn(scr_leds, LV_SYMBOL_LEFT " Back", COL_LAVENDER, led_back_cb);
+    lv_obj_set_size(led_boxes[0], 100, 40); lv_obj_align(led_boxes[0], LV_ALIGN_TOP_LEFT, 10, 10);
 
     make_label(scr_leds, LV_SYMBOL_EDIT " LEDs", COL_PINK, &lv_font_montserrat_20);
     lv_obj_align(lv_obj_get_child(scr_leds, 1), LV_ALIGN_TOP_MID, 0, 15);
@@ -300,11 +316,11 @@ void show_leds() {
     lbl_preset_num = make_label(scr_leds, "", COL_SKY, &lv_font_montserrat_14);
     lv_obj_align(lbl_preset_num, LV_ALIGN_CENTER, 0, -35);
 
-    lv_obj_t *prev = make_btn(scr_leds, LV_SYMBOL_PREV, COL_PEACH, led_prev_cb);
-    lv_obj_set_size(prev, 60, 50); lv_obj_align(prev, LV_ALIGN_CENTER, -80, -45);
+    led_boxes[1] = make_btn(scr_leds, LV_SYMBOL_PREV, COL_PEACH, led_prev_cb);
+    lv_obj_set_size(led_boxes[1], 60, 50); lv_obj_align(led_boxes[1], LV_ALIGN_CENTER, -80, -45);
 
-    lv_obj_t *next = make_btn(scr_leds, LV_SYMBOL_NEXT, COL_PEACH, led_next_cb);
-    lv_obj_set_size(next, 60, 50); lv_obj_align(next, LV_ALIGN_CENTER, 80, -45);
+    led_boxes[2] = make_btn(scr_leds, LV_SYMBOL_NEXT, COL_PEACH, led_next_cb);
+    lv_obj_set_size(led_boxes[2], 60, 50); lv_obj_align(led_boxes[2], LV_ALIGN_CENTER, 80, -45);
 
     lbl_bri = make_label(scr_leds, "", COL_MINT, &lv_font_montserrat_14);
     lv_obj_align(lbl_bri, LV_ALIGN_CENTER, 0, 10);
@@ -315,21 +331,25 @@ void show_leds() {
     lv_obj_align(bar_bri, LV_ALIGN_CENTER, 0, 35);
     lv_obj_set_style_bg_color(bar_bri, COL_MINT, LV_PART_INDICATOR);
 
-    lv_obj_t *bri_dn = make_btn(scr_leds, "-", COL_SKY, led_bri_dn_cb);
-    lv_obj_set_size(bri_dn, 50, 40); lv_obj_align(bri_dn, LV_ALIGN_CENTER, -155, 35);
+    led_boxes[3] = make_btn(scr_leds, "-", COL_SKY, led_bri_dn_cb);
+    lv_obj_set_size(led_boxes[3], 50, 40); lv_obj_align(led_boxes[3], LV_ALIGN_CENTER, -155, 35);
 
-    lv_obj_t *bri_up = make_btn(scr_leds, "+", COL_SKY, led_bri_up_cb);
-    lv_obj_set_size(bri_up, 50, 40); lv_obj_align(bri_up, LV_ALIGN_CENTER, 155, 35);
+    led_boxes[4] = make_btn(scr_leds, "+", COL_SKY, led_bri_up_cb);
+    lv_obj_set_size(led_boxes[4], 50, 40); lv_obj_align(led_boxes[4], LV_ALIGN_CENTER, 155, 35);
 
-    lv_obj_t *pwr = make_btn(scr_leds, "", COL_PINK, led_power_cb);
-    lv_obj_set_size(pwr, 120, 50); lv_obj_align(pwr, LV_ALIGN_BOTTOM_MID, 0, -15);
-    lbl_power = make_label(pwr, "", COL_DARK, &lv_font_montserrat_16);
+    led_boxes[5] = make_btn(scr_leds, "", COL_PINK, led_power_cb);
+    lv_obj_set_size(led_boxes[5], 120, 50); lv_obj_align(led_boxes[5], LV_ALIGN_BOTTOM_MID, 0, -15);
+    lbl_power = make_label(led_boxes[5], "", COL_DARK, &lv_font_montserrat_16);
     lv_obj_center(lbl_power);
 
     refresh_led_screen();
+    led_focus = 0;
+    set_box_focus(led_boxes, LED_BOX_COUNT, led_focus);
   }
   lv_scr_load(scr_leds);
   refresh_led_screen();
+  led_focus = 0;
+  set_box_focus(led_boxes, LED_BOX_COUNT, led_focus);
   last_input_ms = millis();
 }
 
@@ -346,8 +366,8 @@ void show_visualizers() {
     lv_obj_set_style_bg_opa(scr_viz, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr_viz, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back = make_btn(scr_viz, LV_SYMBOL_LEFT " Back", COL_LAVENDER, viz_back_cb);
-    lv_obj_set_size(back, 100, 40); lv_obj_align(back, LV_ALIGN_TOP_LEFT, 10, 10);
+    viz_boxes[0] = make_btn(scr_viz, LV_SYMBOL_LEFT " Back", COL_LAVENDER, viz_back_cb);
+    lv_obj_set_size(viz_boxes[0], 100, 40); lv_obj_align(viz_boxes[0], LV_ALIGN_TOP_LEFT, 10, 10);
 
     make_label(scr_viz, LV_SYMBOL_IMAGE " Visualizers", COL_LAVENDER, &lv_font_montserrat_20);
     lv_obj_align(lv_obj_get_child(scr_viz,1), LV_ALIGN_TOP_MID, 0, 15);
@@ -360,10 +380,12 @@ void show_visualizers() {
     lv_obj_set_width(desc, 360);
     lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
 
-    lv_obj_t *trig = make_btn(scr_viz, LV_SYMBOL_PLAY " Preview Now", COL_MINT, viz_trigger_cb);
-    lv_obj_set_size(trig, 180, 50); lv_obj_align(trig, LV_ALIGN_BOTTOM_MID, 0, -15);
+    viz_boxes[1] = make_btn(scr_viz, LV_SYMBOL_PLAY " Preview Now", COL_MINT, viz_trigger_cb);
+    lv_obj_set_size(viz_boxes[1], 180, 50); lv_obj_align(viz_boxes[1], LV_ALIGN_BOTTOM_MID, 0, -15);
   }
   lv_scr_load(scr_viz);
+  viz_focus = 0;
+  set_box_focus(viz_boxes, 2, viz_focus);
   last_input_ms = millis();
 }
 
@@ -387,6 +409,7 @@ void show_music() {
 
     music_build_ui(scr_music, music_back_cb,
                    COL_PEACH, COL_LAVENDER, COL_DARK, COL_WHITE, COL_MINT);
+    music_set_back_btn(back);
   }
   lv_scr_load(scr_music);
   last_input_ms = millis();

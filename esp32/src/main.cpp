@@ -3,167 +3,212 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include "AudioFileSource.h"
-#include "AudioFileSourceBuffer.h"
 #include "AudioGeneratorMP3.h"
+#include "AudioGeneratorWAV.h"
 #include "AudioOutputI2S.h"
 
-/* GD32 TFT35 onboard SD -> UART2-wire ESP32 bridge -> MP3 decode -> NS4168.
- * GD32 UART PA2 TX -> ESP32 GPIO16 RX; GD32 PA3 RX <- ESP32 GPIO17 TX.
- * Both UARTs 460800, common ground. Card stays in TFT35's slot.
- */
-#define GD32_RX 16
-#define GD32_TX 17
-#define GD32_BAUD 460800
-#define AMP_BCLK 27
-#define AMP_LRCLK 26
-#define AMP_DIN 25
-#define AUDIO_MAX_GAIN 0.8f
-const char *AP_SSID="ledsign-bridge";
-const char *AP_PASS="change-me-1234";
-const char *WLED_IP="192.168.4.2";
+// ============================================================
+// ESP32 DevKitC V4 - bridge + audio decoder for JULIA's Sign
+//
+//   GD32 screen  <--UART1 @ 1 Mbaud-->  ESP32  --WiFi AP/HTTP-->  WLED
+//   (SD card)                             |
+//                                         +--I2S--> NS4168 amp --> speaker
+//
+// The SD card with the music is in the SCREEN. The screen sends the file to us in small
+// chunks when we ask for them (READ), we decode MP3/WAV and play it.
+//
+// Lines GD32 -> ESP32 : PRESET:n ON OFF BRI:n COLOR:r,g,b FX:n SX:n IX:n SAVE:n   (LEDs)
+//                       PLAY:<id>:<size>:<mp3|wav>  STOP  PAUSE  RESUME  VOL:n  STATUS?
+//                       D:<id>:<offset>:<len>:<sum>\n<len raw bytes>   (answer to READ)
+// Lines ESP32 -> GD32 : READY   WLED:UP   READ:<id>:<offset>:<len>   ENDED:<id>
+// ============================================================
+
+// ---- UART to the GD32 screen ----
+#define GD32_RX    16
+#define GD32_TX    17
+#define LINK_BAUD  1000000          // must match LINK_BAUD in gd32/src/hal.h
+
+// ---- WiFi / WLED ----
+const char* AP_SSID = "ledsign-bridge";
+const char* AP_PASS = "change-me-1234";   // min 8 chars, WPA2
+const char* WLED_IP = "192.168.4.2";      // WLED's static IP on the AP
+
+// ---- NS4168 I2S amp ----
+#define AMP_BCLK   27
+#define AMP_LRCLK  26
+#define AMP_DIN    25
+#define AUDIO_MAX_GAIN 0.8f               // volume 100 = this gain; lower it if the speaker distorts
+
+// ---- streaming buffer ----
+#define RING_SIZE  20480                  // ~1 s of a 160 kbps MP3
+#define CHUNK      2048                   // bytes per READ
+
 HardwareSerial SerialGD32(1);
 
-static constexpr uint32_t RING_SIZE=32768;
-static uint8_t ring[RING_SIZE];
-static volatile uint32_t ring_head=0,ring_tail=0;
-static portMUX_TYPE audio_mux=portMUX_INITIALIZER_UNLOCKED;
-static volatile bool src_eof=false,src_open=false,src_playing=false;
-static volatile uint32_t src_size=0,src_pos=0,src_generation=0;
-static volatile int a_vol=60;
-static volatile bool a_volDirty=true;
-static volatile int a_cmd=0; // 1 play, 2 stop, 3 next, 4 prev
-static volatile uint32_t a_seq=0;
-static char a_name[64]="";
-static bool sdOk=true;
-static bool request_pending=false;
-static unsigned long request_ms=0;
-static AudioOutputI2S *aout=nullptr;
-static AudioFileSourceBuffer *abuf=nullptr;
-static AudioGeneratorMP3 *agen=nullptr;
-
-static uint32_t bytes_ready(){
-  portENTER_CRITICAL(&audio_mux);
-  uint32_t n=ring_head-ring_tail;
-  portEXIT_CRITICAL(&audio_mux);return n;
-}
-static void reset_stream(uint32_t length,const String &name){
-  portENTER_CRITICAL(&audio_mux);
-  ring_head=ring_tail=0;src_pos=0;src_size=length;src_eof=false;
-  src_open=true;src_playing=true;src_generation++;
-  strncpy(a_name,name.c_str(),sizeof(a_name)-1);a_name[sizeof(a_name)-1]=0;a_seq++;
-  portEXIT_CRITICAL(&audio_mux);
-  request_pending=false;
-}
-static void add_data(const char *hex){
-  size_t chars=strlen(hex);
-  portENTER_CRITICAL(&audio_mux);
-  for(size_t i=0;i+1<chars;i+=2){
-    if(ring_head-ring_tail>=RING_SIZE)break;
-    auto cv=[](char c)->uint8_t {return c>='0'&&c<='9'?c-'0':c>='A'&&c<='F'?c-'A'+10:c>='a'&&c<='f'?c-'a'+10:0;};
-    ring[(ring_head++)%RING_SIZE]=(cv(hex[i])<<4)|cv(hex[i+1]);
-  }
-  portEXIT_CRITICAL(&audio_mux);
-  request_pending=false;
-}
-class UARTAudioSource : public AudioFileSource {
-public:
-  bool open(const char *) override {return src_open;}
-  bool isOpen() override {return src_open;}
-  bool close() override {return true;}
-  uint32_t getSize() override {return src_size;}
-  uint32_t getPos() override {return src_pos;}
-  bool seek(int32_t pos,int dir) override { // decoder may seek to start or skip ID3
-    uint32_t current=src_pos;
-    int64_t newpos=(dir==SEEK_SET)?pos:(dir==SEEK_CUR)?((int64_t)current+pos):((int64_t)src_size+pos);
-    if(newpos==(int64_t)current)return true;
-    return false; // transport is intentionally sequential
-  }
-  uint32_t readNonBlock(void *dest,uint32_t length) override {return read(dest,length);}
-  uint32_t read(void *dest,uint32_t length) override {
-    uint8_t *out=(uint8_t *)dest;
-    uint32_t count=0;
-    uint32_t generation=src_generation;
-    unsigned long deadline=millis()+3500;
-    while(count<length){
-      if(src_generation!=generation||!src_open||!src_playing)return count;
-      portENTER_CRITICAL(&audio_mux);
-      uint32_t ready=ring_head-ring_tail;
-      uint32_t amount=min((uint32_t)(length-count),ready);
-      for(uint32_t i=0;i<amount;i++)out[count+i]=ring[(ring_tail+i)%RING_SIZE];
-      ring_tail+=amount;src_pos+=amount;
-      portEXIT_CRITICAL(&audio_mux);
-      count+=amount;
-      if(count==length||src_eof||src_pos>=src_size)break;
-      if((long)(millis()-deadline)>=0)break;
-      vTaskDelay(1);
-    }
-    return count;
-  }
+// ============================================================
+// Shared state (guarded by gLock)
+// ============================================================
+static SemaphoreHandle_t gLock;
+struct Lock {
+  Lock()  { xSemaphoreTake(gLock, portMAX_DELAY); }
+  ~Lock() { xSemaphoreGive(gLock); }
 };
-static UARTAudioSource src;
-static uint32_t running_generation=0;
-static bool a_paused=true;
-static void audioTask(void *){
-  aout=new AudioOutputI2S(0,AudioOutputI2S::EXTERNAL_I2S);
-  aout->SetPinout(AMP_BCLK,AMP_LRCLK,AMP_DIN);
-  aout->SetOutputModeMono(true);
-  aout->SetGain(AUDIO_MAX_GAIN*(float)a_vol/100.f);
-  for(;;){
-    if(a_volDirty){a_volDirty=false;aout->SetGain(AUDIO_MAX_GAIN*(float)a_vol/100.f);}
-    if(src_generation!=running_generation){
-      if(agen){agen->stop();delete agen;agen=nullptr;}
-      if(abuf){delete abuf;abuf=nullptr;}
-      running_generation=src_generation;
-      if(src_open){
-        abuf=new AudioFileSourceBuffer(&src,4096);
-        agen=new AudioGeneratorMP3();
-        a_paused=!agen->begin(abuf,aout);
-        src_playing=!a_paused;
-        a_seq++;
+
+static uint8_t  ring[RING_SIZE];
+static uint32_t ringHead = 0, ringTail = 0;
+
+struct AudioStreamState {
+  uint32_t id;
+  uint32_t size;
+  bool     wav;
+  uint32_t rxOffset;      // next byte we need from the screen
+  bool     eof;           // everything has been received
+  bool     active;
+};
+static AudioStreamState st = {0, 0, false, 0, false, false};
+static bool     reqOut = false;           // a READ is in flight
+static uint32_t reqT = 0;
+
+static uint32_t ringAvail() { return (ringHead + RING_SIZE - ringTail) % RING_SIZE; }
+static uint32_t ringFree()  { return RING_SIZE - 1 - ringAvail(); }
+
+static void ringPush(const uint8_t *p, uint32_t n) {
+  uint32_t room = RING_SIZE - ringHead;
+  uint32_t first = (n < room) ? n : room;
+  memcpy(ring + ringHead, p, first);
+  if (n > first) memcpy(ring, p + first, n - first);
+  ringHead = (ringHead + n) % RING_SIZE;
+}
+
+static uint32_t ringPop(uint8_t *p, uint32_t n) {
+  uint32_t av = ringAvail();
+  if (n > av) n = av;
+  uint32_t room = RING_SIZE - ringTail;
+  uint32_t first = (n < room) ? n : room;
+  memcpy(p, ring + ringTail, first);
+  if (n > first) memcpy(p + first, ring, n - first);
+  ringTail = (ringTail + n) % RING_SIZE;
+  return n;
+}
+
+// Flags between tasks
+static volatile bool     a_start = false, a_stop = false, a_pause = false;
+static volatile uint32_t a_endedId = 0;
+static volatile int      a_vol = 60;
+static volatile bool     a_volDirty = true;
+static volatile bool     ev_ready = false, ev_wledUp = false;
+
+// ============================================================
+// Audio: a "file" that is really the byte stream coming from the screen
+// ============================================================
+class StreamSource : public AudioFileSource {
+ public:
+  StreamSource(uint32_t id, uint32_t size) : myId(id), total(size), pos(0) {}
+
+  uint32_t read(void *data, uint32_t len) {
+    uint8_t *p = (uint8_t *)data;
+    uint32_t got = 0;
+    uint32_t t0 = millis();
+    while (got < len) {
+      uint32_t n = 0;
+      bool gone = false, finished = false;
+      {
+        Lock l;
+        if (st.id != myId) gone = true;
+        else {
+          n = ringPop(p + got, len - got);
+          finished = st.eof && ringAvail() == 0;
+        }
       }
-    }
-    int cmd=a_cmd;if(cmd){a_cmd=0;
-      if(cmd==1){a_paused=false;src_playing=true;a_seq++;}
-      else if(cmd==2){a_paused=true;src_playing=false;a_seq++;}
-      else if(cmd==3||cmd==4){a_paused=true;src_playing=false;}
-    }
-    if(agen&&!a_paused&&agen->isRunning()){
-      if(!agen->loop()){
-        src_playing=false;a_paused=true;a_seq++;
-        if(src_eof||src_pos>=src_size)SerialGD32.println("A:NEXT");
-      }
+      if (gone) break;
+      got += n;
+      pos += n;
+      if (got >= len) break;
+      if (n > 0) { t0 = millis(); continue; }
+      if (finished) break;                     // true end of the file
+      if (millis() - t0 > 1500) break;         // screen went quiet: give up on this song
       vTaskDelay(1);
-    } else vTaskDelay(8);
+    }
+    return got;
+  }
+
+  uint32_t readNonBlock(void *data, uint32_t len) { return read(data, len); }
+
+  bool seek(int32_t off, int dir) {            // forward only (decoders skip tags this way)
+    int32_t target;
+    if (dir == SEEK_SET)      target = off;
+    else if (dir == SEEK_CUR) target = (int32_t)pos + off;
+    else                      target = (int32_t)total + off;
+    if (target < (int32_t)pos) return false;
+    uint8_t scratch[64];
+    while ((int32_t)pos < target) {
+      uint32_t want = (uint32_t)(target - (int32_t)pos);
+      if (want > sizeof(scratch)) want = sizeof(scratch);
+      if (read(scratch, want) == 0) return false;
+    }
+    return true;
+  }
+
+  bool close() { return true; }
+  bool isOpen() { Lock l; return st.id == myId; }
+  uint32_t getSize() { return total; }
+  uint32_t getPos() { return pos; }
+
+ private:
+  uint32_t myId, total, pos;
+};
+
+static AudioOutputI2S *aout = nullptr;
+static StreamSource   *asrc = nullptr;
+static AudioGenerator *agen = nullptr;
+static uint32_t        curId = 0;
+
+static float volToGain(int v) { return AUDIO_MAX_GAIN * (float)constrain(v, 0, 100) / 100.0f; }
+
+static void stopDecoder() {
+  if (agen) { agen->stop(); delete agen; agen = nullptr; }
+  if (asrc) { delete asrc; asrc = nullptr; }
+}
+
+static void startDecoder() {
+  uint32_t id, size;
+  bool wav, active;
+  {
+    Lock l;
+    id = st.id; size = st.size; wav = st.wav; active = st.active;
+  }
+  if (!active) return;
+  curId = id;
+  asrc = new StreamSource(id, size);
+  if (wav) agen = new AudioGeneratorWAV();
+  else     agen = new AudioGeneratorMP3();
+  if (!agen->begin(asrc, aout)) {                   // unreadable: tell the screen so it skips ahead
+    stopDecoder();
+    a_endedId = id;
   }
 }
-static void audioBegin(){
-  xTaskCreatePinnedToCore(audioTask,"audio",12288,nullptr,2,nullptr,1);
+
+static void audioTask(void *) {
+  for (;;) {
+    if (a_stop)  { a_stop = false; stopDecoder(); }
+    if (a_start) { a_start = false; stopDecoder(); startDecoder(); }
+    if (a_volDirty) { a_volDirty = false; if (aout) aout->SetGain(volToGain(a_vol)); }
+
+    if (agen && agen->isRunning()) {
+      if (!a_pause) {
+        if (!agen->loop()) {                        // song finished
+          uint32_t id = curId;
+          stopDecoder();
+          a_endedId = id;
+        }
+      }
+      vTaskDelay(a_pause ? 10 : 1);
+    } else {
+      vTaskDelay(10);
+    }
+  }
 }
-static uint32_t lastReportedSeq=0xffffffff;
-static void sendTrackAndState(){
-  if(a_name[0]){SerialGD32.print("TRACK:");SerialGD32.println(a_name);}
-  SerialGD32.println(src_playing?"STATE:PLAY":"STATE:STOP");
-  lastReportedSeq=a_seq;
-}
-static void sendStatus(){
-  SerialGD32.println(sdOk?"READY":"NOSD");sendTrackAndState();
-}
-static void reportAudioChanges(){if(a_seq!=lastReportedSeq)sendTrackAndState();}
-static void processAudioLine(const String &line){
-  if(line.startsWith("A:DATA:")){add_data(line.c_str()+7);}
-  else if(line.startsWith("A:FILE:")){
-    int sep=line.indexOf(':',7);
-    if(sep>7){uint32_t size=strtoul(line.substring(7,sep).c_str(),nullptr,10);
-      reset_stream(size,line.substring(sep+1));sdOk=true;}
-  } else if(line=="A:EOF"){src_eof=true;request_pending=false;}
-  else if(line=="A:NOSD"){sdOk=false;src_playing=false;src_open=false;src_generation++;request_pending=false;
-    a_name[0]=0;a_seq++;SerialGD32.println("NOSD");}
-}
-static void requestData(){
-  if(!src_open||src_eof||!src_playing)return;
-  if(request_pending){if(millis()-request_ms<1600)return;request_pending=false;}
-  if(bytes_ready()<12500){SerialGD32.println("A:READ");request_pending=true;request_ms=millis();}
-}
+
 // ============================================================
 // WLED over its JSON HTTP API
 // ============================================================
@@ -171,7 +216,7 @@ static bool wledUp = false;
 static int  wledFails = 0;
 
 bool wledPost(const String &jsonBody) {
-  if (WiFi.softAPgetStationNum() == 0) { wledUp = false; return false; }   // WLED not on the AP yet: don't wait on timeouts
+  if (WiFi.softAPgetStationNum() == 0) { wledUp = false; return false; }   // WLED not on the AP yet
   HTTPClient http;
   String url = String("http://") + WLED_IP + "/json/state";
   http.begin(url);
@@ -249,14 +294,14 @@ void wledSavePreset(int slot) {
   wledPost(out);
 }
 
-// Until WLED answers, poll it every few seconds. When it first appears, tell the GD32 so it
-// pushes the current preset / brightness / power again (the sign powers up with both at once).
+// Until WLED answers, poll it every few seconds; when it first appears, tell the screen so it
+// pushes the current preset / brightness / power again.
 static void wledPoll() {
   static uint32_t lastTry = 0;
   if (wledUp) return;
   if (millis() - lastTry < 4000) return;
   lastTry = millis();
-  if (WiFi.softAPgetStationNum() == 0) return;       // nobody has joined the AP yet
+  if (WiFi.softAPgetStationNum() == 0) return;
   HTTPClient http;
   http.begin(String("http://") + WLED_IP + "/json/info");
   http.setConnectTimeout(300);
@@ -266,33 +311,39 @@ static void wledPoll() {
   if (code == 200) {
     wledUp = true;
     wledFails = 0;
-    SerialGD32.println("WLED:UP");
+    ev_wledUp = true;
     Serial.println("[WLED] online");
   }
 }
 
-// ============================================================
-// Commands from the GD32 (and from the USB serial monitor for testing)
-// ============================================================
-void handleCommand(String cmd) {
-  cmd.trim();
-  if (cmd.length() == 0) return;
+// ---- LED commands are queued (latest per type wins) and executed by loop(), because the HTTP calls
+//      can take hundreds of ms and must never stall the link task that feeds the music ----
+enum { L_PRESET, L_FX, L_SX, L_IX, L_COLOR, L_BRI, L_POWER, L_SAVE, L_COUNT };
+static char       ledPend[L_COUNT][40];
+static bool       ledHas[L_COUNT];
+static portMUX_TYPE ledMux = portMUX_INITIALIZER_UNLOCKED;
 
-  if (cmd == "PLAY") {
-    if (!src_open) SerialGD32.println("A:OPEN");
-    a_cmd = 1;
-  } else if (cmd == "STOP") {
-    a_cmd = 2;
-  } else if (cmd == "NEXT") {
-    a_cmd = 3; SerialGD32.println("A:NEXT");
-  } else if (cmd == "PREV") {
-    a_cmd = 4; SerialGD32.println("A:PREV");
-  } else if (cmd.startsWith("VOL:")) {
-    a_vol = constrain((int)cmd.substring(4).toInt(), 0, 100);
-    a_volDirty = true;
-  } else if (cmd == "STATUS?" || cmd == "TRACKLIST?") {
-    sendStatus();
-  } else if (cmd.startsWith("PRESET:")) {
+static void queueLed(const char *cmd) {
+  int k = -1;
+  if (strncmp(cmd, "PRESET:", 7) == 0)      k = L_PRESET;
+  else if (strncmp(cmd, "FX:", 3) == 0)     k = L_FX;
+  else if (strncmp(cmd, "SX:", 3) == 0)     k = L_SX;
+  else if (strncmp(cmd, "IX:", 3) == 0)     k = L_IX;
+  else if (strncmp(cmd, "COLOR:", 6) == 0)  k = L_COLOR;
+  else if (strncmp(cmd, "BRI:", 4) == 0)    k = L_BRI;
+  else if (strcmp(cmd, "ON") == 0 || strcmp(cmd, "OFF") == 0) k = L_POWER;
+  else if (strncmp(cmd, "SAVE:", 5) == 0)   k = L_SAVE;
+  if (k < 0) { Serial.printf("[CMD] Unknown command: %s\n", cmd); return; }
+  portENTER_CRITICAL(&ledMux);
+  strncpy(ledPend[k], cmd, sizeof(ledPend[k]) - 1);
+  ledPend[k][sizeof(ledPend[k]) - 1] = '\0';
+  ledHas[k] = true;
+  portEXIT_CRITICAL(&ledMux);
+}
+
+static void runLedCommand(String cmd) {
+  cmd.trim();
+  if (cmd.startsWith("PRESET:")) {
     wledSelectPreset(cmd.substring(7).toInt());
   } else if (cmd == "ON") {
     wledSetPower(true);
@@ -317,55 +368,207 @@ void handleCommand(String cmd) {
     wledSetIntensity((uint8_t)constrain(cmd.substring(3).toInt(), 0, 255));
   } else if (cmd.startsWith("SAVE:")) {
     wledSavePreset(cmd.substring(5).toInt());
+  }
+}
+
+static void runPendingLed() {
+  for (int k = 0; k < L_COUNT; k++) {
+    char buf[40];
+    bool has;
+    portENTER_CRITICAL(&ledMux);
+    has = ledHas[k];
+    if (has) { memcpy(buf, ledPend[k], sizeof(buf)); ledHas[k] = false; }
+    portEXIT_CRITICAL(&ledMux);
+    if (has) runLedCommand(String(buf));
+  }
+}
+
+// ============================================================
+// Link to the GD32 screen (this task is the ONLY one that touches SerialGD32)
+// ============================================================
+static void sendLine(const char *s) {
+  SerialGD32.print(s);
+  SerialGD32.print("\r\n");
+}
+
+static void handleLine(const char *l) {
+  if (strncmp(l, "PLAY:", 5) == 0) {
+    unsigned long id = 0, size = 0;
+    char ext[8] = {0};
+    if (sscanf(l + 5, "%lu:%lu:%7s", &id, &size, ext) >= 2) {
+      {
+        Lock lk;
+        ringHead = ringTail = 0;
+        st.id = (uint32_t)id;
+        st.size = (uint32_t)size;
+        st.wav = (strcmp(ext, "wav") == 0);
+        st.rxOffset = 0;
+        st.eof = false;
+        st.active = true;
+        reqOut = false;
+      }
+      a_pause = false;
+      a_start = true;
+    }
+  } else if (strcmp(l, "STOP") == 0) {
+    {
+      Lock lk;
+      st.active = false;
+      st.id++;                                      // invalidates anything still in flight
+      ringHead = ringTail = 0;
+      reqOut = false;
+    }
+    a_stop = true;
+  } else if (strcmp(l, "PAUSE") == 0) {
+    a_pause = true;
+  } else if (strcmp(l, "RESUME") == 0) {
+    a_pause = false;
+  } else if (strncmp(l, "VOL:", 4) == 0) {
+    a_vol = constrain(atoi(l + 4), 0, 100);
+    a_volDirty = true;
+  } else if (strcmp(l, "STATUS?") == 0) {
+    ev_ready = true;
   } else {
-    Serial.printf("[CMD] Unknown command: %s\n", cmd.c_str());
+    queueLed(l);
+  }
+}
+
+// A complete D: frame arrived
+static void finishFrame(uint32_t id, uint32_t off, uint32_t len, uint32_t sum, const uint8_t *buf) {
+  uint32_t s = 0;
+  for (uint32_t i = 0; i < len; i++) s += buf[i];
+  s &= 0xFFFFu;
+  Lock l;
+  if (!st.active || id != st.id) return;            // stale frame from an older song
+  reqOut = false;
+  if (off != st.rxOffset || s != sum) return;       // damaged or out of order: ask again
+  if (len == 0) { st.eof = true; return; }
+  if (ringFree() < len) return;
+  ringPush(buf, len);
+  st.rxOffset += len;
+  if (st.rxOffset >= st.size) st.eof = true;
+}
+
+static void linkTask(void *) {
+  static char    line[96];
+  static uint8_t frame[CHUNK];
+  int      len = 0;
+  bool     inData = false;
+  uint32_t dId = 0, dOff = 0, dLen = 0, dSum = 0, dGot = 0, dLast = 0;
+
+  for (;;) {
+    while (SerialGD32.available()) {
+      if (!inData) {
+        int ch = SerialGD32.read();
+        if (ch == '\n') {
+          line[len] = '\0';
+          if (len > 2 && line[0] == 'D' && line[1] == ':') {
+            unsigned long a, b, c, d;
+            if (sscanf(line + 2, "%lu:%lu:%lu:%lu", &a, &b, &c, &d) == 4 && c <= CHUNK) {
+              dId = (uint32_t)a; dOff = (uint32_t)b; dLen = (uint32_t)c; dSum = (uint32_t)d;
+              dGot = 0;
+              dLast = millis();
+              if (dLen == 0) finishFrame(dId, dOff, 0, dSum, frame);
+              else           inData = true;
+            }
+          } else if (len > 0) {
+            handleLine(line);
+          }
+          len = 0;
+        } else if (ch != '\r' && len < (int)sizeof(line) - 1) {
+          line[len++] = (char)ch;
+        }
+      } else {
+        uint32_t want = dLen - dGot;
+        uint32_t av = (uint32_t)SerialGD32.available();
+        if (av < want) want = av;
+        size_t n = SerialGD32.readBytes(frame + dGot, want);
+        dGot += (uint32_t)n;
+        dLast = millis();
+        if (dGot >= dLen) {
+          inData = false;
+          finishFrame(dId, dOff, dLen, dSum, frame);
+        }
+      }
+    }
+
+    if (inData && (millis() - dLast) > 300) {       // bytes went missing: drop the frame, ask again
+      inData = false;
+      Lock l;
+      reqOut = false;
+    }
+
+    if (ev_ready)  { ev_ready = false;  sendLine("READY"); }
+    if (ev_wledUp) { ev_wledUp = false; sendLine("WLED:UP"); }
+    uint32_t ended = a_endedId;
+    if (ended) {
+      a_endedId = 0;
+      char b[32];
+      snprintf(b, sizeof(b), "ENDED:%lu", (unsigned long)ended);
+      sendLine(b);
+    }
+
+    // Ask for the next piece of the song whenever the buffer has room.
+    bool doReq = false;
+    uint32_t rId = 0, rOff = 0;
+    {
+      Lock l;
+      if (st.active && !st.eof && !reqOut && ringFree() >= CHUNK) {
+        rId = st.id; rOff = st.rxOffset;
+        reqOut = true;
+        reqT = millis();
+        doReq = true;
+      } else if (reqOut && (millis() - reqT) > 1000) {
+        reqOut = false;                             // request or answer was lost: retry
+      }
+    }
+    if (doReq) {
+      char b[64];
+      snprintf(b, sizeof(b), "READ:%lu:%lu:%u", (unsigned long)rId, (unsigned long)rOff, (unsigned)CHUNK);
+      sendLine(b);
+    }
+
+    vTaskDelay(1);
   }
 }
 
 // ============================================================
 // Setup / loop
 // ============================================================
-static String gd32Buffer;
-static bool   gd32Overflow = false;
-
 void setup() {
   Serial.begin(115200);
-  SerialGD32.begin(GD32_BAUD, SERIAL_8N1, GD32_RX, GD32_TX);
-  gd32Buffer.reserve(850);
+  gLock = xSemaphoreCreateMutex();
 
-  audioBegin();
+  SerialGD32.setRxBufferSize(8192);
+  SerialGD32.begin(LINK_BAUD, SERIAL_8N1, GD32_RX, GD32_TX);
+
+  aout = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
+  aout->SetPinout(AMP_BCLK, AMP_LRCLK, AMP_DIN);
+  aout->SetOutputModeMono(true);                    // NS4168 is a mono amp
+  aout->SetGain(volToGain(a_vol));
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.print("[AP] Started, IP: ");
-  Serial.println(WiFi.softAPIP());                   // normally 192.168.4.1
+  Serial.println(WiFi.softAPIP());                  // normally 192.168.4.1
 
-  sendStatus();                                      // READY (or NOSD) -> GD32 pushes LED state
+  xTaskCreatePinnedToCore(linkTask,  "link",  6144,  nullptr, 3, nullptr, 1);
+  xTaskCreatePinnedToCore(audioTask, "audio", 12288, nullptr, 2, nullptr, 1);
+
+  ev_ready = true;                                  // READY -> the screen pushes LED state and volume
   Serial.println("[Bridge] ESP32 bridge ready");
 }
 
 void loop() {
-  while (SerialGD32.available()) {
-    char c = (char)SerialGD32.read();
-    if (c == '\n') {
-      if (!gd32Overflow) { if (gd32Buffer.startsWith("A:")) processAudioLine(gd32Buffer); else handleCommand(gd32Buffer); }
-      gd32Buffer = "";
-      gd32Overflow = false;
-    } else if (c != '\r' && !gd32Overflow) {
-      if (gd32Buffer.length() < 840) gd32Buffer += c;
-      else { gd32Buffer = ""; gd32Overflow = true; Serial.println("[GD32] Discarded oversized command"); }
-    }
-  }
+  runPendingLed();
+  wledPoll();
 
-  // USB serial monitor: type PLAY / NEXT / VOL:40 / STATUS? ... for bench testing.
+  // USB serial monitor: type VOL:40, PRESET:3, ON ... for bench testing.
   static String usbBuffer;
   while (Serial.available()) {
     char c = (char)Serial.read();
-    if (c == '\n') { handleCommand(usbBuffer); usbBuffer = ""; }
-    else if (c != '\r' && usbBuffer.length() < 96) usbBuffer += c;
+    if (c == '\n') { handleLine(usbBuffer.c_str()); usbBuffer = ""; }
+    else if (c != '\r' && usbBuffer.length() < 90) usbBuffer += c;
   }
-
-  requestData();
-  reportAudioChanges();
-  wledPoll();
+  delay(2);
 }

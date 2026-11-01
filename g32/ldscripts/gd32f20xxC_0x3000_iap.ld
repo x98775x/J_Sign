@@ -3,7 +3,7 @@ ENTRY(Reset_Handler)
 _Min_Heap_Size = 0x200;
 _Min_Stack_Size = 0x400;
 MEMORY {
- FLASH (rx) : ORIGIN = 0x08003000, LENGTH = 244K
+ FLASH (rx) : ORIGIN = 0x08003000, LENGTH = 240K
  RAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
 }
 _estack = 0x20020000;

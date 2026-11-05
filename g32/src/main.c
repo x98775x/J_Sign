@@ -8,6 +8,10 @@
 static lv_disp_draw_buf_t draw_buf;
 static lv_color_t buf1[SCREEN_W * 20];
 
+static void ui_load_menu_screen(lv_obj_t *screen) {
+  if (lv_scr_act() != screen) lv_scr_load(screen);
+}
+
 // ============================================================
 // Pastel palette
 // ============================================================
@@ -151,10 +155,15 @@ static lv_obj_t* make_btn_ud(lv_obj_t *p, const char *txt,
 #define make_btn(p, txt, bg, cb) make_btn_ud((p), (txt), (bg), (cb), NULL)
 
 static void set_box_focus(lv_obj_t **boxes, int count, int sel) {
-  for (int i = 0; i < count; i++) {
+  for (int i = 0; i < count; ++i) {
     if (!boxes[i]) continue;
-    lv_obj_set_style_border_width(boxes[i], i == sel ? 3 : 0, 0);
-    lv_obj_set_style_border_color(boxes[i], COL_WHITE, 0);
+    lv_obj_set_style_bg_opa(boxes[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(boxes[i],
+      i == sel ? lv_color_hex(0x465273) : lv_color_hex(0xCBD4E7), 0);
+    lv_obj_set_style_text_color(boxes[i], lv_color_white(), 0);
+    lv_obj_set_style_border_width(boxes[i], i == sel ? 2 : 0, 0);
+    lv_obj_set_style_border_color(boxes[i], lv_color_hex(0x25334F), 0);
+    lv_obj_set_style_outline_width(boxes[i], 0, 0);
   }
 }
 
@@ -191,9 +200,52 @@ static void menu_btn_cb(lv_event_t *e) {
 }
 
 void refresh_menu_highlight(void) {
-  for (int i = 0; i < 4; i++) {
-    lv_obj_set_style_border_width(menu_btns[i], i==menu_sel ? 3 : 0, 0);
-    lv_obj_set_style_border_color(menu_btns[i], COL_WHITE, 0);
+  for (int i = 0; i < 4; ++i) {
+    if (!menu_btns[i]) continue;
+    lv_color_t base = menu_colors[i];
+    lv_obj_set_style_bg_color(menu_btns[i],
+      i == menu_sel ? lv_color_mix(lv_color_black(), base, 115) : base, 0);
+    lv_obj_set_style_border_width(menu_btns[i], i == menu_sel ? 2 : 0, 0);
+    lv_obj_set_style_border_color(menu_btns[i], lv_color_hex(0x25334F), 0);
+    lv_obj_set_style_outline_width(menu_btns[i], 0, 0);
+    lv_obj_t *label = lv_obj_get_child(menu_btns[i], 0);
+    if (label) lv_obj_set_style_text_color(label,
+      i == menu_sel ? lv_color_white() : COL_DARK, 0);
+  }
+}
+
+/* Animated rainbow ripples behind the main-menu buttons.  Native LVGL
+ * primitives only; no image assets or extra flash resources needed. */
+static void rainbow_ripple_cb(void *obj, int32_t diameter) {
+  if (lv_scr_act() != scr_menu) return;  /* don't redraw hidden menus */
+  lv_obj_t *ring = (lv_obj_t *)obj;
+  lv_obj_set_size(ring, (lv_coord_t)diameter, (lv_coord_t)diameter);
+  lv_obj_align(ring, LV_ALIGN_CENTER, 0, 0);
+}
+
+static void build_rainbow_background(lv_obj_t *parent) {
+  const uint32_t colors[] = { 0xFF628E, 0xFFC65C, 0x8CEB89, 0x5ECDF5, 0xAF83FF };
+  for (int i = 0; i < 5; ++i) {
+    lv_obj_t *ring = lv_obj_create(parent);
+    lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(ring, lv_color_hex(colors[i]), 0);
+    lv_obj_set_style_border_opa(ring, LV_OPA_50, 0);
+    lv_obj_set_style_border_width(ring, 9, 0);
+    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_all(ring, 0, 0);
+    lv_obj_set_style_shadow_width(ring, 0, 0);
+    lv_obj_set_size(ring, 40 + i * 105, 40 + i * 105);
+    lv_obj_center(ring);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, ring);
+    lv_anim_set_exec_cb(&a, rainbow_ripple_cb);
+    lv_anim_set_values(&a, 40, 650);
+    lv_anim_set_time(&a, 10000);
+    lv_anim_set_delay(&a, i * 1700);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
   }
 }
 
@@ -205,20 +257,23 @@ void show_menu(void) {
     lv_obj_set_style_bg_color(scr_menu, COL_DARK, 0);
     lv_obj_set_style_bg_opa(scr_menu, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr_menu, LV_OBJ_FLAG_SCROLLABLE);
+    build_rainbow_background(scr_menu);
 
     lv_obj_t *title = make_label(scr_menu, "JULIA", COL_PINK, &lv_font_montserrat_24);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
-    // 4 buttons, slightly narrower to fit
+    // Centered, compact two-column layout.
     for (int i = 0; i < 4; i++) {
       menu_btns[i] = make_btn_ud(scr_menu, menu_labels[i], menu_colors[i],
                              menu_btn_cb, (void*)(intptr_t)i);
-      lv_obj_set_size(menu_btns[i], 105, 190);
-      lv_obj_align(menu_btns[i], LV_ALIGN_CENTER, (i-1)*112 + (i>1?-4:4), 20);
+      lv_obj_set_size(menu_btns[i], 172, 72);
+      lv_obj_align(menu_btns[i], LV_ALIGN_CENTER,
+                   (i % 2 == 0) ? -93 : 93,
+                   (i < 2) ? -45 : 45);
     }
     refresh_menu_highlight();
   }
-  lv_scr_load(scr_menu);
+  ui_load_menu_screen(scr_menu);
   in_screensaver = false;
   last_input_ms = millis();
 }
@@ -335,7 +390,7 @@ void show_leds(void) {
     led_focus = 0;
     set_box_focus(led_boxes, LED_BOX_COUNT, led_focus);
   }
-  lv_scr_load(scr_leds);
+  ui_load_menu_screen(scr_leds);
   refresh_led_screen();
   led_focus = 0;
   set_box_focus(led_boxes, LED_BOX_COUNT, led_focus);
@@ -372,7 +427,7 @@ void show_visualizers(void) {
     viz_boxes[1] = make_btn(scr_viz, LV_SYMBOL_PLAY " Preview Now", COL_MINT, viz_trigger_cb);
     lv_obj_set_size(viz_boxes[1], 180, 50); lv_obj_align(viz_boxes[1], LV_ALIGN_BOTTOM_MID, 0, -15);
   }
-  lv_scr_load(scr_viz);
+  ui_load_menu_screen(scr_viz);
   viz_focus = 0;
   set_box_focus(viz_boxes, 2, viz_focus);
   last_input_ms = millis();
@@ -400,7 +455,7 @@ void show_music(void) {
                    COL_PEACH, COL_LAVENDER, COL_DARK, COL_WHITE, COL_MINT);
     music_btn_back = back;                      /* scan once below, after loading the page */
   }
-  lv_scr_load(scr_music);
+  ui_load_menu_screen(scr_music);
   music_set_back_btn(music_btn_back);
   last_input_ms = millis();
 }
@@ -421,7 +476,7 @@ void show_custom(void) {
                     COL_PINK, COL_LAVENDER, COL_MINT,
                     COL_PEACH, COL_SKY, COL_DARK, COL_WHITE);
   }
-  lv_scr_load(scr_custom);
+  ui_load_menu_screen(scr_custom);
   custom_reset_focus();
   last_input_ms = millis();
 }
@@ -688,9 +743,9 @@ static void cal_tick(void) {
 }
 
 void after_splash(void) {
-  /* Saved calibration -> straight to the menu. Hold the knob in during power-up to redo it. */
-  if (touch_ready && !hal_enc_button_down()) show_menu();
-  else cal_start();
+  /* Never block startup on the touch panel. Use saved calibration if available;
+     otherwise the encoder provides navigation without touch. */
+  show_menu();
 }
 
 // ============================================================
